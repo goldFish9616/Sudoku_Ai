@@ -201,11 +201,71 @@ class SudokuAI(competitive_sudoku.sudokuai.SudokuAI):
     # removes values already present in the row, column and block (C0 rule), and taboo moves.
     # ------------------------------------------------------------------
 
-    def evaluate(self, state: GameState, me: int) -> float:
-        """Score difference from the point of view of player `me`."""
-        return state.scores[me - 1] - state.scores[2 - me]
+    W_TEMPO = 0.5      # weight of points the side to move can take right now
+    W_MOBILITY = 0.25  # bound of the mobility tiebreaker (< smallest tempo step)
 
-    # ------------------------------------------------------------------
-    # Now(!!!) it is our points minus the opponent’s points. scores[2 - me] is the
-    # opponent’s index (for me = 1 it is 1, for me = 2 it is 0).
-    # ------------------------------------------------------------------
+    def evaluate(self, state: GameState, me: int) -> float:
+        """Heuristic value of `state` from `me`'s point of view (higher = better).
+        1. score difference            -- dominant term
+        2. tempo: points the side to move can score with its next move
+           (+ if that is `me`, - otherwise); reduces the horizon effect
+           of handing the opponent a region with one empty cell
+        3. mobility: normalized difference in allowed empty cells, bounded
+           by W_MOBILITY so it only breaks ties"""
+        opp = 3 - me
+        value = state.scores[me - 1] - state.scores[opp - 1]
+        if self.is_board_full(state):
+            return value
+
+        to_move = state.current_player
+        squares_to_move = self.allowed_empty(state, to_move)
+
+        gain = self.best_immediate_gain(state, squares_to_move)
+        value += self.W_TEMPO * gain if to_move == me else -self.W_TEMPO * gain
+
+        mob = {to_move: len(squares_to_move),
+               3 - to_move: len(self.allowed_empty(state, 3 - to_move))}
+        value += self.W_MOBILITY * (mob[me] - mob[opp]) / max(1, mob[me] + mob[opp])
+        return value
+
+    @staticmethod
+    def allowed_empty(state: GameState, player: int):
+        """Empty cells `player` may play in (all empty cells in classic mode)."""
+        saved, state.current_player = state.current_player, player
+        squares = state.player_squares()
+        state.current_player = saved
+        if squares is None:
+            N = state.board.N
+            squares = [divmod(k, N) for k, v in enumerate(state.board.squares)
+                       if v == SudokuBoard.empty]
+        return squares
+
+    @staticmethod
+    def best_immediate_gain(state: GameState, squares) -> int:
+        """Max points obtainable with one legal move on `squares`."""
+        board = state.board
+        N, m, n = board.N, board.m, board.n
+        sq, empty = board.squares, SudokuBoard.empty
+        bpr = N // n  # blocks per block-row
+        row_e, col_e, blk_e = [0] * N, [0] * N, [0] * N
+        for k in range(N * N):
+            if sq[k] == empty:
+                i, j = divmod(k, N)
+                row_e[i] += 1
+                col_e[j] += 1
+                blk_e[(i // m) * bpr + j // n] += 1
+
+        taboo = {(t.square, t.value) for t in state.taboo_moves}
+        best = 0
+        for (i, j) in squares:
+            done = (row_e[i] == 1) + (col_e[j] == 1) + (blk_e[(i // m) * bpr + j // n] == 1)
+            if SCORE_TABLE[done] <= best:
+                continue
+            r0, c0 = (i // m) * m, (j // n) * n
+            used = {sq[i * N + c] for c in range(N)} | {sq[r * N + j] for r in range(N)}
+            used |= {sq[r * N + c] for r in range(r0, r0 + m) for c in range(c0, c0 + n)}
+            if any(v not in used and ((i, j), v) not in taboo for v in range(1, N + 1)):
+                best = SCORE_TABLE[done]
+                if best == SCORE_TABLE[3]:
+                    break
+        return best
